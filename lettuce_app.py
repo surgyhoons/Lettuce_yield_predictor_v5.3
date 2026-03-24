@@ -1,6 +1,10 @@
 """
 식물공장 상추 수확량 예측 시스템 — Streamlit 앱
 실행: streamlit run lettuce_app.py
+
+[DB 모드]
+  - 로컬 CSV : DB_배치데이터.csv (기본, 로컬 실행 시)
+  - Google Sheets : .streamlit/secrets.toml 에 인증 정보 설정 시 자동 사용
 """
 
 import streamlit as st
@@ -41,14 +45,81 @@ DB_COLS = [
 WEEKDAYS_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
 # ──────────────────────────────────────────────────────────────
-# 2. DB 로드 / 저장 (세션 + CSV)
+# 2. Google Sheets 연동 헬퍼
+# ──────────────────────────────────────────────────────────────
+
+def _is_gsheet_configured() -> bool:
+    """secrets.toml 에 gcp_service_account 와 google_sheets 가 모두 있으면 True"""
+    try:
+        _ = st.secrets["gcp_service_account"]
+        _ = st.secrets["google_sheets"]["sheet_url"]
+        return True
+    except (KeyError, FileNotFoundError):
+        return False
+
+@st.cache_resource(show_spinner=False)
+def _get_gsheet_client():
+    """gspread 클라이언트를 캐싱하여 반환 (연결 1회만 수행)"""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        gc = gspread.authorize(creds)
+        return gc
+    except Exception as e:
+        st.error(f"Google Sheets 인증 실패: {e}")
+        return None
+
+def _get_worksheet():
+    """시트 URL 에서 첫 번째 워크시트를 반환"""
+    gc = _get_gsheet_client()
+    if gc is None:
+        return None
+    sheet_url = st.secrets["google_sheets"]["sheet_url"]
+    return gc.open_by_url(sheet_url).sheet1
+
+def _load_from_gsheet() -> pd.DataFrame:
+    ws = _get_worksheet()
+    if ws is None:
+        return pd.DataFrame(columns=DB_COLS)
+    records = ws.get_all_records()
+    df = pd.DataFrame(records) if records else pd.DataFrame(columns=DB_COLS)
+    for c in DB_COLS:
+        if c not in df.columns:
+            df[c] = None
+    # 빈 문자열 → NaN
+    df.replace("", np.nan, inplace=True)
+    return df[DB_COLS].copy()
+
+def _save_to_gsheet(df: pd.DataFrame):
+    ws = _get_worksheet()
+    if ws is None:
+        return
+    ws.clear()
+    data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+    ws.update(data)
+
+# ──────────────────────────────────────────────────────────────
+# 3. DB 로드 / 저장 (세션 + CSV or Google Sheets)
 # ──────────────────────────────────────────────────────────────
 DB_FILE = "DB_배치데이터.csv"
 
-def load_db_from_file(uploaded=None):
-    """업로드된 파일 또는 로컬 파일에서 DB 로드"""
+def _db_mode() -> str:
+    """현재 DB 모드 반환: 'gsheet' or 'csv'"""
+    return "gsheet" if _is_gsheet_configured() else "csv"
+
+def load_db_from_file(uploaded=None) -> pd.DataFrame:
+    """업로드된 파일 또는 현재 DB 소스(Google Sheets / 로컬 CSV)에서 로드"""
     if uploaded is not None:
         df = pd.read_csv(uploaded, encoding="utf-8-sig")
+    elif _db_mode() == "gsheet":
+        df = _load_from_gsheet()
     elif os.path.exists(DB_FILE):
         df = pd.read_csv(DB_FILE, encoding="utf-8-sig")
     else:
@@ -56,10 +127,15 @@ def load_db_from_file(uploaded=None):
     for c in DB_COLS:
         if c not in df.columns:
             df[c] = None
+    df.replace("", np.nan, inplace=True)
     return df[DB_COLS].copy()
 
 def save_db(df: pd.DataFrame):
-    df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
+    """현재 DB 모드에 맞게 저장 (Google Sheets 또는 로컬 CSV)"""
+    if _db_mode() == "gsheet":
+        _save_to_gsheet(df)
+    else:
+        df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
 
 def get_db() -> pd.DataFrame:
     if "db" not in st.session_state:
@@ -71,7 +147,7 @@ def set_db(df: pd.DataFrame):
     save_db(df)
 
 # ──────────────────────────────────────────────────────────────
-# 3. 예측 계산 함수
+# 4. 예측 계산 함수
 # ──────────────────────────────────────────────────────────────
 def prepare_db(df: pd.DataFrame, loss_rate: float,
                default_weight_g: float, mgs_weight_g: float) -> pd.DataFrame:
@@ -83,17 +159,14 @@ def prepare_db(df: pd.DataFrame, loss_rate: float,
     d["weight_per_plant_g"] = pd.to_numeric(d["weight_per_plant_g"], errors="coerce")
     d["actual_yield"]       = pd.to_numeric(d["actual_yield"],       errors="coerce")
     d["actual_weight_kg"]   = pd.to_numeric(d["actual_weight_kg"],   errors="coerce")
-    # 주당 무게 기본값: MGS / 고정 별도 적용
     d.loc[d["bed_type"] == "fixed", "weight_per_plant_g"] = \
         d.loc[d["bed_type"] == "fixed", "weight_per_plant_g"].fillna(default_weight_g)
     d.loc[d["bed_type"] == "mgs",   "weight_per_plant_g"] = \
         d.loc[d["bed_type"] == "mgs",   "weight_per_plant_g"].fillna(mgs_weight_g)
-    # 날짜 역전 제거
     bad = d["harvest_date"].notna() & d["plant_date"].notna() & (d["harvest_date"] < d["plant_date"])
     if bad.any():
         st.warning(f"날짜 역전 {bad.sum()}건 제외됨")
         d = d[~bad]
-    # 총 재배일수 (파종 → 수확)
     d["total_days"] = (d["harvest_date"] - d["sow_date"]).dt.days
     return d
 
@@ -112,7 +185,6 @@ def add_predictions(d: pd.DataFrame) -> pd.DataFrame:
     d = d.copy()
     d["predicted_plants"] = results["predicted_plants"]
     d["predicted_kg"]     = results["predicted_kg"]
-    # 실제 주당무게
     d["actual_wpg"] = None
     mask = d["actual_yield"].notna() & d["actual_weight_kg"].notna() & (d["actual_yield"] > 0)
     d.loc[mask, "actual_wpg"] = (
@@ -121,7 +193,7 @@ def add_predictions(d: pd.DataFrame) -> pd.DataFrame:
     return d
 
 # ──────────────────────────────────────────────────────────────
-# 4. UI 헬퍼
+# 5. UI 헬퍼
 # ──────────────────────────────────────────────────────────────
 def fmt_d(v, fmt="%m-%d"):
     try:    return pd.Timestamp(v).strftime(fmt)
@@ -134,7 +206,6 @@ def diff_str(actual, pred):
     return f"+{d}" if d >= 0 else str(d)
 
 def metric_card(label, value, sub=None, color=None):
-    """작은 지표 카드 HTML"""
     color_style = f"color:{color};" if color else ""
     sub_html    = f"<div style='font-size:11px;color:#888;margin-top:2px'>{sub}</div>" if sub else ""
     return (
@@ -145,11 +216,17 @@ def metric_card(label, value, sub=None, color=None):
     )
 
 # ──────────────────────────────────────────────────────────────
-# 5. 사이드바 설정
+# 6. 사이드바 설정
 # ──────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🌿 수확량 예측")
     st.markdown("---")
+
+    # ── DB 모드 표시 배지 ──────────────────────────────────────
+    if _db_mode() == "gsheet":
+        st.success("🟢 Google Sheets 연동 중", icon=None)
+    else:
+        st.info("📄 로컬 CSV 모드", icon=None)
 
     st.subheader("⚙️ 예측 설정")
     pred_date = st.date_input("예측 기준일", value=date.today(), key="sb_pred_date")
@@ -172,6 +249,12 @@ with st.sidebar:
         set_db(load_db_from_file(uploaded))
         st.success("DB 로드 완료")
 
+    # Google Sheets 새로고침 버튼 (gsheet 모드일 때만 표시)
+    if _db_mode() == "gsheet":
+        if st.button("🔄 시트에서 새로고침", key="sb_gs_reload"):
+            st.session_state.pop("db", None)
+            st.rerun()
+
     if st.button("💾 DB 다운로드", key="sb_dl_btn"):
         db_now = get_db()
         csv_bytes = db_now.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -183,7 +266,7 @@ with st.sidebar:
     st.caption(f"수확률: **{100-loss_pct}%** (로스율 {loss_pct}%)")
 
 # ──────────────────────────────────────────────────────────────
-# 6. 탭 레이아웃
+# 7. 탭 레이아웃
 # ──────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["📊 3일 대시보드", "📅 달별 전체 뷰", "📋 배치 DB 관리", "✍️ 실적 입력", "🔧 참고 용량표"]
@@ -219,7 +302,6 @@ with tab1:
         total_pp = d3_pp + d4_pp
         total_pk = round(d3_pk + d4_pk, 1)
 
-        # ── 3일 카드 ──
         wd = lambda d: WEEKDAYS_KR[d.weekday()]
         cols = st.columns(3)
 
@@ -256,7 +338,6 @@ with tab1:
         day_col(cols[1], "D+3 · 수확 예정", dash_dates[1], d3_pp, d3_pk, d3_ap, d3_ak, "#3B6D11")
         day_col(cols[2], "D+4 · 수확 예정", dash_dates[2], d4_pp, d4_pk, d4_ap, d4_ak, "#185FA5")
 
-        # ── 합계 바 ──
         st.markdown("---")
         sc = st.columns(4)
         sc[0].metric("이번 주 예측 주수 (D+3~4)", f"{total_pp:,}주")
@@ -270,7 +351,6 @@ with tab1:
         sc[3].metric("MGS",
                      f"{int(mgs_p):,}주 / {round(float(mgs_k),1)} kg" if mgs_p else "N/A")
 
-        # ── 배치 상세 테이블 ──
         st.markdown("---")
         st.subheader("배치별 상세 (D+3~4)")
 
@@ -315,7 +395,6 @@ with tab1:
             ]
             st.dataframe(disp, use_container_width=True, hide_index=True)
 
-            # 노션 마크다운
             with st.expander("📋 노션 마크다운 복사"):
                 md_lines = [
                     f"## 수확량 예측 — {pred_date} 기준",
@@ -486,7 +565,7 @@ with tab3:
                         "actual_weight_kg":   None,
                         "note":               note_input,
                     }
-                    db = db[db["batch_id"] != batch_id]  # 중복 덮어쓰기
+                    db = db[db["batch_id"] != batch_id]
                     db = pd.concat([db, pd.DataFrame([new_row])], ignore_index=True)
                     set_db(db)
                     st.success(f"✅ {batch_id} 추가 완료 (DB 총 {len(db)}건)")
@@ -540,7 +619,6 @@ with tab4:
         for col in ["actual_yield", "actual_weight_kg"]:
             db_now[col] = pd.to_numeric(db_now[col], errors="coerce")
 
-        # 미입력 배치만 표시 (실적이 없는 것 우선)
         show_all = st.checkbox("실적 완료 배치도 표시", value=False, key="tab4_show_all")
         if show_all:
             candidates = db_now
@@ -552,8 +630,6 @@ with tab4:
         if candidates.empty:
             st.success("모든 배치에 실적이 입력되어 있습니다.")
         else:
-            # ── st.form 없이 위젯 직접 렌더링 ──────────────────
-            # key에 탭 접두사 + 행 인덱스를 포함해 중복 방지
             input_vals = {}
             for idx, (_, row) in enumerate(candidates.iterrows()):
                 bid = row["batch_id"]
