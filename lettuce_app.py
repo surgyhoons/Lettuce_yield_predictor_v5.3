@@ -77,12 +77,15 @@ def _get_gsheet_client():
         return None
 
 def _get_worksheet():
-    """시트 URL 에서 첫 번째 워크시트를 반환"""
     gc = _get_gsheet_client()
     if gc is None:
         return None
     sheet_url = st.secrets["google_sheets"]["sheet_url"]
-    return gc.open_by_url(sheet_url).sheet1
+    spreadsheet = gc.open_by_url(sheet_url)
+    sheet_name = st.secrets["google_sheets"].get("sheet_name", None)
+    if sheet_name:
+        return spreadsheet.worksheet(sheet_name)
+    return spreadsheet.sheet1
 
 def _load_from_gsheet() -> pd.DataFrame:
     ws = _get_worksheet()
