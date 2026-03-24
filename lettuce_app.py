@@ -152,30 +152,30 @@ with st.sidebar:
     st.markdown("---")
 
     st.subheader("⚙️ 예측 설정")
-    pred_date = st.date_input("예측 기준일", value=date.today())
-    loss_pct  = st.slider("로스율 (%)", 0, 50, 20, step=1,
+    pred_date = st.date_input("예측 기준일", value=date.today(), key="sb_pred_date")
+    loss_pct  = st.slider("로스율 (%)", 0, 50, 20, step=1, key="sb_loss_pct",
                           help="기본 20% = 수확률 80%")
     loss_rate = loss_pct / 100
 
     st.markdown("---")
     st.subheader("주당 기본 무게 (g)")
-    default_weight_g = st.number_input("고정 재배대", value=100, min_value=1, step=1,
+    default_weight_g = st.number_input("고정 재배대", value=100, min_value=1, step=1, key="sb_fixed_w",
                                         help="배치별 입력값 없을 때 적용")
-    mgs_weight_g     = st.number_input("MGS (NFT)", value=100, min_value=1, step=1,
+    mgs_weight_g     = st.number_input("MGS (NFT)", value=100, min_value=1, step=1, key="sb_mgs_w",
                                         help="MGS 배치 기본 무게 — 고정 재배대와 별도 설정 가능")
 
     st.markdown("---")
     st.subheader("📁 DB 파일")
-    uploaded = st.file_uploader("CSV 업로드", type=["csv"],
+    uploaded = st.file_uploader("CSV 업로드", type=["csv"], key="sb_uploader",
                                  help="DB_배치데이터.csv 형식")
     if uploaded:
         set_db(load_db_from_file(uploaded))
         st.success("DB 로드 완료")
 
-    if st.button("💾 DB 다운로드"):
+    if st.button("💾 DB 다운로드", key="sb_dl_btn"):
         db_now = get_db()
         csv_bytes = db_now.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button("⬇ CSV 저장", csv_bytes, "DB_배치데이터.csv", "text/csv")
+        st.download_button("⬇ CSV 저장", csv_bytes, "DB_배치데이터.csv", "text/csv", key="sb_dl_csv")
 
     st.markdown("---")
     total_cap = sum(t * PLANTS_PER_TRAY for t in FIXED_BED_CONFIG.values())
@@ -432,7 +432,7 @@ with tab3:
     db = get_db()
 
     mode = st.radio("작업 선택", ["조회", "배치 추가", "실적 수정", "배치 삭제"],
-                    horizontal=True)
+                    horizontal=True, key="tab3_mode")
 
     if mode == "조회":
         st.dataframe(db, use_container_width=True, hide_index=True)
@@ -498,7 +498,7 @@ with tab3:
         if not batch_ids:
             st.info("배치가 없습니다.")
         else:
-            sel = st.selectbox("배치 선택", batch_ids)
+            sel = st.selectbox("배치 선택", batch_ids, key="tab3_sel_batch")
             row = db_edit[db_edit["batch_id"] == sel].iloc[0]
             with st.form("edit_actual"):
                 ea, ek = st.columns(2)
@@ -521,8 +521,8 @@ with tab3:
         if db_now.empty:
             st.info("삭제할 배치가 없습니다.")
         else:
-            del_ids = st.multiselect("삭제할 배치 선택", db_now["batch_id"].tolist())
-            if del_ids and st.button("🗑️ 삭제", type="primary"):
+            del_ids = st.multiselect("삭제할 배치 선택", db_now["batch_id"].tolist(), key="tab3_del_ids")
+            if del_ids and st.button("🗑️ 삭제", type="primary", key="tab3_del_btn"):
                 db_now = db_now[~db_now["batch_id"].isin(del_ids)]
                 set_db(db_now)
                 st.success(f"🗑️ {len(del_ids)}건 삭제 완료 (DB 총 {len(db_now)}건)")
@@ -541,41 +541,50 @@ with tab4:
             db_now[col] = pd.to_numeric(db_now[col], errors="coerce")
 
         # 미입력 배치만 표시 (실적이 없는 것 우선)
-        show_all = st.checkbox("실적 완료 배치도 표시", value=False)
+        show_all = st.checkbox("실적 완료 배치도 표시", value=False, key="tab4_show_all")
         if show_all:
             candidates = db_now
         else:
-            candidates = db_now[db_now["actual_weight_kg"].isna() | (db_now["actual_weight_kg"] == 0)]
+            candidates = db_now[
+                db_now["actual_weight_kg"].isna() | (db_now["actual_weight_kg"] == 0)
+            ]
 
         if candidates.empty:
             st.success("모든 배치에 실적이 입력되어 있습니다.")
         else:
-            with st.form("bulk_actual"):
-                rows_data = {}
-                for _, row in candidates.iterrows():
-                    bid = row["batch_id"]
-                    hd  = fmt_d(pd.to_datetime(row["harvest_date"], errors="coerce"))
-                    st.markdown(f"**{bid}** — 수확예정 {hd} | {row.get('bed_id','?')}번")
-                    c1, c2 = st.columns(2)
-                    ay = c1.number_input(f"실제 주수 ({bid})",
-                                          value=int(row["actual_yield"]) if pd.notna(row["actual_yield"]) else 0,
-                                          min_value=0, key=f"ay_{bid}")
-                    ak = c2.number_input(f"실제 무게 kg ({bid})",
-                                          value=float(row["actual_weight_kg"]) if pd.notna(row["actual_weight_kg"]) else 0.0,
-                                          min_value=0.0, step=0.1, format="%.1f", key=f"ak_{bid}")
-                    rows_data[bid] = (ay, ak)
-                    st.markdown("---")
+            # ── st.form 없이 위젯 직접 렌더링 ──────────────────
+            # key에 탭 접두사 + 행 인덱스를 포함해 중복 방지
+            input_vals = {}
+            for idx, (_, row) in enumerate(candidates.iterrows()):
+                bid = row["batch_id"]
+                hd  = fmt_d(pd.to_datetime(row["harvest_date"], errors="coerce"))
+                st.markdown(f"**{bid}** — 수확예정 {hd} | {row.get('bed_id', '?')}번")
+                c1, c2 = st.columns(2)
+                ay = c1.number_input(
+                    f"실제 주수",
+                    value=int(row["actual_yield"]) if pd.notna(row["actual_yield"]) else 0,
+                    min_value=0,
+                    key=f"t4_ay_{idx}_{bid}",
+                )
+                ak = c2.number_input(
+                    f"실제 무게 (kg)",
+                    value=float(row["actual_weight_kg"]) if pd.notna(row["actual_weight_kg"]) else 0.0,
+                    min_value=0.0, step=0.1, format="%.1f",
+                    key=f"t4_ak_{idx}_{bid}",
+                )
+                input_vals[bid] = (ay, ak)
+                st.markdown("---")
 
-                if st.form_submit_button("💾 일괄 저장"):
-                    db_upd = get_db().copy()
-                    saved = 0
-                    for bid, (ay, ak) in rows_data.items():
-                        if ay > 0 or ak > 0:
-                            db_upd.loc[db_upd["batch_id"] == bid, "actual_yield"]     = ay if ay > 0 else None
-                            db_upd.loc[db_upd["batch_id"] == bid, "actual_weight_kg"] = ak if ak > 0 else None
-                            saved += 1
-                    set_db(db_upd)
-                    st.success(f"✅ {saved}건 저장 완료 → 대시보드 탭에서 확인하세요")
+            if st.button("💾 일괄 저장", key="tab4_save_btn", type="primary"):
+                db_upd = get_db().copy()
+                saved = 0
+                for bid, (ay, ak) in input_vals.items():
+                    if ay > 0 or ak > 0:
+                        db_upd.loc[db_upd["batch_id"] == bid, "actual_yield"]     = ay if ay > 0 else None
+                        db_upd.loc[db_upd["batch_id"] == bid, "actual_weight_kg"] = ak if ak > 0 else None
+                        saved += 1
+                set_db(db_upd)
+                st.success(f"✅ {saved}건 저장 완료 → 대시보드 탭에서 확인하세요")
 
 # ──────────────────────────────────────────────────────────────
 # TAB 5: 참고 용량표
